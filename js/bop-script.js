@@ -2891,6 +2891,11 @@ async function showRealisasiModal(realisasi = null) {
     // ✅ Load upload config
     await loadUploadConfig();
     
+    // ✅ Hitung ulang konteks batas RPD (sisa anggaran per pos) setiap modal dibuka,
+    // supaya tidak memakai angka lama dari pembukaan modal sebelumnya.
+    _posLimitCache = null;
+    _posLimitCacheKey = '';
+    
     // ✅ PERBAIKAN: Reset uploadedFiles (harus pakai 'let' di global, bukan 'const')
     uploadedFiles = [];
     
@@ -3155,7 +3160,7 @@ async function showRealisasiModal(realisasi = null) {
                 <button class="btn-close" onclick="closeRealisasiModal()">×</button>
             </div>
             
-            <form id="realisasiForm" data-editing-id="${realisasi ? realisasi.id : ''}">
+            <form id="realisasiForm" data-editing-id="${realisasi ? realisasi.id : ''}" data-kua="${realisasi ? (realisasi.kua || '') : (currentUser.kua || '')}">
                 <div class="modal-body">
                     
                     <!-- Info Budget -->
@@ -3661,11 +3666,19 @@ function loadRPDDataFromSelect() {
                 const rpdValue = rpdData[code] && rpdData[code][item] ? rpdData[code][item] : 0;
                 
                 parametersHTML += `
-                    <div class="rpd-subitem" style="display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 10px; align-items: center;">
+                    <div class="rpd-subitem realisasi-subitem">
                         <label style="margin: 0;">${item}</label>
                         <div style="text-align: right; padding: 10px; background: #e9ecef; border-radius: 6px;">
                             <small style="display: block; color: #666; font-size: 11px;">Anggaran RPD</small>
                             <strong style="color: #333; font-size: 14px;">${formatCurrency(rpdValue)}</strong>
+                        </div>
+                        <div class="sisa-box"
+                             data-code="${code}"
+                             data-item="${item}"
+                             data-input-id="${inputId}">
+                            <small class="sisa-label">Sisa Anggaran (Setahun)</small>
+                            <strong class="sisa-value">...</strong>
+                            <span class="sisa-note"></span>
                         </div>
                         <input type="text" 
                                id="${inputId}"
@@ -3697,6 +3710,8 @@ function loadRPDDataFromSelect() {
                 const inputs = document.querySelectorAll('.realisasi-input');
                 inputs.forEach(input => {
                     input.addEventListener('input', calculateRealisasiTotal);
+                    // ✅ Update field "Sisa Anggaran (Setahun)" setiap ada perubahan input
+                    input.addEventListener('input', updateRealisasiSisaFields);
                     // Auto-update AP summary on every keystroke
                     input.addEventListener('input', () => {
                         if (month && year && currentUser && currentUser.kua) {
@@ -3706,6 +3721,7 @@ function loadRPDDataFromSelect() {
                 });
                 
                 calculateRealisasiTotal();
+                updateRealisasiSisaFields();
                 
                 // ✅ Auto Payment: disable POS aktif jika ada config
                 if (month && year && currentUser && currentUser.kua) {
@@ -4501,7 +4517,7 @@ async function _getRealisasiPosLimitContext(kua, month, year, excludeId) {
     const kuaApCfg = apCfg[kua] || null;
     const relevantMonths = [...new Set(
         allReal.filter(r => r.kua === kua && String(r.year) === String(year)
-                          && (r.status === 'Approved' || r.status === 'Paid')
+                          && (normalizeStatus(r.status) === STATUS.APPROVED || normalizeStatus(r.status) === STATUS.PAID)
                           && r.id !== excludeId)
                .map(r => r.month)
     )];
@@ -4517,7 +4533,7 @@ async function _getRealisasiPosLimitContext(kua, month, year, excludeId) {
     const used = {}; // used[code][item] = sum
     allReal.forEach(r => {
         if (r.kua !== kua || String(r.year) !== String(year)) return;
-        if (r.status !== 'Approved' && r.status !== 'Paid') return;
+        if (normalizeStatus(r.status) !== STATUS.APPROVED && normalizeStatus(r.status) !== STATUS.PAID) return;
         if (r.id === excludeId) return;
         const nom = nomByMonth[r.month] || {};
         Object.entries(r.data || {}).forEach(([code, items]) => {
@@ -4542,6 +4558,149 @@ function _posLabelClient(code, item) {
     const param = APP_CONFIG.BOP.RPD_PARAMETERS[code];
     const codeName = param ? param.name : code;
     return item === 'Nominal' ? codeName : `${codeName} — ${item}`;
+}
+
+/**
+ * ✅ BARU — Isi field "Sisa Anggaran (Setahun)" di setiap pos akun pada form
+ * realisasi (#realisasiModal):
+ *
+ *     Sisa = total RPD setahun pos tsb − total realisasi (Approved/Paid) pos tsb
+ *
+ * Nilai bisa NEGATIF (mis. RPD setahun Rp 0 tapi realisasi Jan–Jul sudah
+ * Rp 690.000 → sisa −Rp 690.000). Realisasi yang sedang diedit tidak ikut
+ * dihitung (excludeId), dan angka "setelah input ini" ikut berubah saat
+ * operator mengetik.
+ *
+ * Sumber angka sama persis dengan validasi di server
+ * (_validateRealisasiAgainstRPD), jadi yang terlihat di sini = yang dipakai
+ * untuk memblokir simpan.
+ */
+async function updateRealisasiSisaFields() {
+    const boxes = document.querySelectorAll('#realisasiParameters .sisa-box');
+    if (!boxes.length) return;
+
+    const formEl    = document.getElementById('realisasiForm');
+    const excludeId = formEl?.dataset.editingId || null;
+    const kua       = formEl?.dataset.kua || (currentUser && currentUser.kua) || '';
+    const month     = document.getElementById('realisasiMonth')?.value;
+    const year      = document.getElementById('realisasiYear')?.value || new Date().getFullYear();
+
+    if (!kua || !month) {
+        boxes.forEach(b => {
+            const v = b.querySelector('.sisa-value');
+            if (v) v.textContent = '-';
+        });
+        return;
+    }
+
+    let ctx, apCfg;
+    try {
+        ctx   = await _getRealisasiPosLimitContext(kua, month, year, excludeId);
+        apCfg = (await apGetConfig()) || {};
+    } catch (e) {
+        console.warn('[SISA_FIELDS] Gagal memuat konteks (non-fatal):', e);
+        boxes.forEach(b => {
+            const v = b.querySelector('.sisa-value');
+            if (v) v.textContent = 'N/A';
+        });
+        return;
+    }
+
+    const negativePos = [];
+    boxes.forEach(box => {
+        const code  = box.dataset.code;
+        const item  = box.dataset.item;
+        const input = document.getElementById(box.dataset.inputId);
+        const valEl  = box.querySelector('.sisa-value');
+        const noteEl = box.querySelector('.sisa-note');
+
+        // Pos Auto Payment (SAKTI): nominal otomatis, tidak dijaga per-pos di form
+        if (apCfg[kua] && apCfg[kua][code] === true) {
+            box.className = 'sisa-box sisa-auto';
+            valEl.textContent  = 'Otomatis';
+            noteEl.textContent = 'Dibayar via SAKTI';
+            return;
+        }
+
+        const cap     = (ctx.rpdAnnual[code] && ctx.rpdAnnual[code][item]) || 0;
+        const used    = (ctx.used[code] && ctx.used[code][item]) || 0;
+        const sisa    = cap - used;                                   // bisa negatif
+        const entered = input ? parseFormattedNumber(input.value) : 0;
+        const after   = sisa - entered;
+
+        let state = 'ok';
+        let note  = '';
+        if (sisa < 0) {
+            state = 'over';
+            note  = 'Sudah melebihi RPD setahun — tidak dapat direalisasikan';
+        } else if (sisa === 0) {
+            state = 'empty';
+            note  = 'Anggaran pos ini sudah habis';
+        }
+        if (entered > 0) {
+            if (after < 0) state = 'over';
+        }
+
+        box.className = 'sisa-box sisa-' + state;
+        box.title = `RPD setahun ${formatCurrency(cap)} − realisasi ${formatCurrency(used)} = ${formatCurrency(sisa)}`;
+        valEl.textContent = formatCurrency(sisa);
+        // Angka dibungkus .nowrap agar tanda minus tidak terpisah dari "Rp ..." saat teks turun baris
+        if (entered > 0) {
+            noteEl.innerHTML = `Setelah input ini:<br><span class="nowrap">${formatCurrency(after)}</span>`;
+        } else {
+            noteEl.textContent = note;
+        }
+
+        // Kumpulkan pos yang masih minus (sisa saat ini < 0 atau setelah input < 0)
+        if (after < 0) negativePos.push(_posLabelClient(code, item));
+
+        if (input && !input.disabled) {
+            input.classList.toggle('input-over-limit', entered > 0 && after < 0);
+        }
+    });
+
+    _applySisaSubmitLock(formEl, negativePos);
+}
+
+/**
+ * Nonaktifkan tombol submit selama masih ada pos yang minus, dan tampilkan
+ * alasannya. Status disimpan di form.dataset.sisaBlocked supaya
+ * calculateRealisasiTotal() tidak meng-enable tombol lagi.
+ */
+function _applySisaSubmitLock(formEl, negativePos) {
+    if (!formEl) return;
+    const submitBtn  = formEl.querySelector('button[type="submit"]');
+    const wasBlocked = formEl.dataset.sisaBlocked === '1';
+    const blocked    = negativePos.length > 0;
+    formEl.dataset.sisaBlocked = blocked ? '1' : '0';
+
+    let warn = document.getElementById('sisaBlockWarning');
+    if (blocked) {
+        if (!warn) {
+            warn = document.createElement('div');
+            warn.id = 'sisaBlockWarning';
+            warn.className = 'budget-over-warning';
+            const totalSection = document.querySelector('.total-section');
+            if (totalSection) totalSection.insertAdjacentElement('afterend', warn);
+        }
+        if (warn) {
+            warn.innerHTML = '⛔ <strong>Realisasi tidak dapat disimpan mohon konsultasikan ke bendahara, karena sisa anggaran setahun minus untuk pos:</strong><br>' +
+                negativePos.map(n => `• ${n}`).join('<br>');
+            warn.style.display = 'block';
+        }
+        if (submitBtn) {
+            submitBtn.disabled = true;
+            submitBtn.title = 'Ada pos dengan sisa anggaran minus';
+        }
+    } else {
+        if (warn) warn.style.display = 'none';
+        if (submitBtn) submitBtn.removeAttribute('title');
+        // Lepas kunci: biarkan validasi total/budget menentukan status tombol
+        if (wasBlocked) {
+            if (submitBtn) submitBtn.disabled = false; // Admin: tidak ada guard lain
+            calculateRealisasiTotal();               // Operator KUA: guard budget/RPD menentukan ulang
+        }
+    }
 }
 
 async function calculateRealisasiTotal() {
@@ -4619,7 +4778,7 @@ async function calculateRealisasiTotal() {
                     const cap  = (ctx.rpdAnnual[code] && ctx.rpdAnnual[code][item] !== undefined) ? (ctx.rpdAnnual[code][item] || 0) : 0;
                     const used = (ctx.used[code] && ctx.used[code][item] !== undefined) ? (ctx.used[code][item] || 0) : 0;
                     if (used + value > cap) {
-                        const sisa = Math.max(0, cap - used);
+                        const sisa = cap - used; // bisa negatif bila pos sudah melebihi RPD setahun
                         annualMessages.push(`${label}: sisa RPD setahun ${formatCurrency(sisa)}, diajukan ${formatCurrency(value)}`);
                     }
                 });
@@ -4667,7 +4826,8 @@ async function calculateRealisasiTotal() {
             if (submitBtn) submitBtn.disabled = true;
         } else {
             if (warningBanner) warningBanner.style.display = 'none';
-            if (submitBtn) submitBtn.disabled = false;
+            // ✅ Tetap terkunci bila masih ada pos minus (lihat _applySisaSubmitLock)
+            if (submitBtn) submitBtn.disabled = (formElRT?.dataset.sisaBlocked === '1');
         }
     }
 }
@@ -8206,6 +8366,7 @@ document.addEventListener('DOMContentLoaded', function() {
 window.downloadRealisasiPerYear = downloadRealisasiPerYear;
 window.downloadRealisasiDetailYear = downloadRealisasiDetailYear;
 window.loadRPDDataFromSelect = loadRPDDataFromSelect;
+window.updateRealisasiSisaFields = updateRealisasiSisaFields;
 window.closeRealisasiModal = closeRealisasiModal;
 window.removeUploadedFile = removeUploadedFile;
 window.removeExistingFile = removeExistingFile;
