@@ -4593,10 +4593,15 @@ async function updateRealisasiSisaFields() {
         return;
     }
 
-    let ctx, apCfg;
+    let ctx, apCfg, apNomBulan = {};
     try {
         ctx   = await _getRealisasiPosLimitContext(kua, month, year, excludeId);
         apCfg = (await apGetConfig()) || {};
+        // Nominal SAKTI bulan yang sedang diisi (per kode) — ikut mengurangi Sisa
+        if (apCfg[kua]) {
+            const nomData = await apGetNominals(month, year);
+            apNomBulan = (nomData && nomData[kua]) ? nomData[kua] : {};
+        }
     } catch (e) {
         console.warn('[SISA_FIELDS] Gagal memuat konteks (non-fatal):', e);
         boxes.forEach(b => {
@@ -4614,11 +4619,27 @@ async function updateRealisasiSisaFields() {
         const valEl  = box.querySelector('.sisa-value');
         const noteEl = box.querySelector('.sisa-note');
 
-        // Pos Auto Payment (SAKTI): nominal otomatis, tidak dijaga per-pos di form
+        // Pos Auto Payment (SAKTI): input manual dikunci, tetapi nominal SAKTI bulan ini
+        // tetap dihitung sebagai realisasi:
+        //   Sisa = RPD setahun − realisasi sebelumnya (AP-aware) − nominal SAKTI bulan ini
         if (apCfg[kua] && apCfg[kua][code] === true) {
-            box.className = 'sisa-box sisa-auto';
-            valEl.textContent  = 'Otomatis';
-            noteEl.textContent = 'Dibayar via SAKTI';
+            const capAP   = (ctx.rpdAnnual[code] && ctx.rpdAnnual[code][item]) || 0;
+            const usedAP  = (ctx.used[code] && ctx.used[code][item]) || 0;
+            const saktiNom = parseFloat(apNomBulan[code] || 0) || 0;
+            const sisaAP  = capAP - usedAP - saktiNom;
+
+            let stateAP = 'ok';
+            let noteAP  = 'Dibayar via SAKTI: ' + formatCurrency(saktiNom);
+            if (sisaAP < 0)        { stateAP = 'over';  noteAP += ' — melebihi RPD setahun'; }
+            else if (sisaAP === 0) { stateAP = 'empty'; }
+
+            box.className = 'sisa-box sisa-' + stateAP;
+            box.title = `RPD setahun ${formatCurrency(capAP)} − realisasi sebelumnya ${formatCurrency(usedAP)} − SAKTI bulan ini ${formatCurrency(saktiNom)} = ${formatCurrency(sisaAP)}`;
+            valEl.textContent  = formatCurrency(sisaAP);
+            noteEl.textContent = noteAP;
+
+            // Sama dengan server: hanya diblokir bila ada nominal SAKTI yang diajukan
+            if (saktiNom > 0 && sisaAP < 0) negativePos.push(_posLabelClient(code, item));
             return;
         }
 
@@ -5457,6 +5478,17 @@ async function _injectViewRealisasiExtras(realisasi) {
     // We use the data-code attribute set on each .rpd-item div to find the right element,
     // then append RPD comparison rows under each existing rpd-subitem.
     if (rpdData && rpdData.data) {
+        // Pos SAKTI: input manual = 0, jadi realisasi sebenarnya adalah nominal SAKTI bulan ini
+        let _apCfgKua = null, _apNomKua = {};
+        try {
+            await apGetConfig();
+            _apCfgKua = (_apConfig && _apConfig[realisasi.kua]) ? _apConfig[realisasi.kua] : null;
+            if (_apCfgKua) {
+                const _nd = await apGetNominals(realisasi.month, realisasi.year);
+                _apNomKua = (_nd && _nd[realisasi.kua]) ? _nd[realisasi.kua] : {};
+            }
+        } catch (e) { /* abaikan: fallback ke perhitungan biasa */ }
+
         document.querySelectorAll('.rpd-item[data-code]').forEach(itemEl => {
             const code = itemEl.dataset.code;
             const rpdItems = rpdData.data[code];
@@ -5473,7 +5505,10 @@ async function _injectViewRealisasiExtras(realisasi) {
 
             itemNames.forEach((item, idx) => {
                 const rpd     = parseFloat(rpdItems[item] || 0);
-                const realVal = parseFloat(realItems[item] || 0);
+                const isAPPos = !!(_apCfgKua && _apCfgKua[code] === true);
+                const realVal = isAPPos
+                    ? (parseFloat(_apNomKua[code] || 0) || 0)   // nominal SAKTI bulan ini
+                    : parseFloat(realItems[item] || 0);
                 const sisa    = rpd - realVal;
                 const siColor = sisa >= 0 ? '#28a745' : '#dc3545';
                 const siLabel = sisa >= 0 ? 'Sisa' : 'Melebihi';
