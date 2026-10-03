@@ -116,6 +116,8 @@ function doPost(e) {
       case 'getAutoPaymentConfig':
       case 'saveAutoPaymentConfig':
       case 'getAutoPaymentNominal':
+      case 'getAutoPaymentNominalYear':
+      case 'getBopBootstrap':
         // Delegate ke BOP module
         result = handleBOPAction(action, data);
         break;
@@ -178,6 +180,10 @@ function doPost(e) {
         result = { success: false, message: 'Action tidak dikenal' };
     }
     
+    // ✅ PERFORMA: aksi tulis → naikkan versi cache BOP agar pembacaan berikutnya selalu segar.
+    //    Dilakukan SESUDAH penulisan selesai & SEBELUM respons dikirim ke client.
+    try { if (typeof _bopInvalidateForAction === 'function') _bopInvalidateForAction(action); } catch (_ce) {}
+
     // ✅ FIX: Convert result to proper response format with CORS
     // return createCORSResponse(result);
     return ContentService.createTextOutput(JSON.stringify(result))
@@ -216,8 +222,17 @@ function errorResponse(message) {
 }
 
 // ===== DATABASE HELPERS =====
+// ✅ PERFORMA: objek Spreadsheet di-memo per eksekusi. Sebelumnya openById() dipanggil
+//    di SETIAP getSheet() (belasan kali per request) → lambat & boros kuota.
+var _SS_MEMO = null;
+function _getSS() {
+  if (_SS_MEMO) return _SS_MEMO;
+  _SS_MEMO = SpreadsheetApp.openById(SS_ID);
+  return _SS_MEMO;
+}
+
 function getSheet(sheetName) {
-  const ss = SpreadsheetApp.openById(SS_ID);
+  const ss = _getSS();
   let sheet = ss.getSheetByName(sheetName);
   
   if (!sheet) {

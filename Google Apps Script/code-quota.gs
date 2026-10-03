@@ -112,7 +112,7 @@ function _readRawQuota() {
  * fully self-contained and immune to override conflicts.
  */
 function _getConfigSheet() {
-  var ss    = SpreadsheetApp.openById(SS_ID);
+  var ss    = (typeof _getSS === 'function') ? _getSS() : SpreadsheetApp.openById(SS_ID);
   var sheet = ss.getSheetByName(QUOTA_SHEET_NAME);
   if (!sheet) {
     throw new Error('Sheet "' + QUOTA_SHEET_NAME + '" not found in spreadsheet ' + SS_ID);
@@ -165,9 +165,31 @@ function getApiQuota(data) {
  * the call is blocked rather than sneaking through.
  */
 function _decrementApiQuota() {
-  var lock = LockService.getScriptLock();
+  // ── TAHAP 1 (SEBELUM lock): siapkan sheet & lokasi baris kuota ──────────────
+  // ✅ PERFORMA: lock global ini dipakai SEMUA operator yang menyimpan. Sebelumnya lock dipegang
+  //    selama openById + baca seluruh sheet + tulis + flush (±1–2 dtk) sehingga 31 operator
+  //    yang menyimpan bersamaan saling antre sampai timeout. Sekarang di dalam lock hanya:
+  //    baca 1 baris (2 sel) → tulis 1 sel → flush.
+  var sheet, row;   // row = nomor baris sheet (1-based)
+  try {
+    sheet = _getConfigSheet();
+    row   = _findQuotaRow(sheet);
+  } catch (prepErr) {
+    Logger.log('[QUOTA] ✗ Prepare error: ' + prepErr.toString() + ' → BLOCKING call');
+    return { exceeded: true, quota: 0 };
+  }
 
-  // Acquire lock — wait up to 15 s
+  if (row === -1) {
+    // Baris belum ada — buat (dengan nilai 0) lalu blok, sama seperti sebelumnya
+    try {
+      Logger.log('[QUOTA] ✗ API_QUOTA row not found → auto-creating with 0 and blocking');
+      sheet.appendRow([QUOTA_CONFIG_KEY, 0]);
+    } catch (e) { Logger.log('[QUOTA] ✗ Could not create row: ' + e.toString()); }
+    return { exceeded: true, quota: 0 };
+  }
+
+  // ── TAHAP 2: lock minimal ───────────────────────────────────────────────────
+  var lock = LockService.getScriptLock();
   var acquired = false;
   try {
     acquired = lock.tryLock(15000);
@@ -182,44 +204,35 @@ function _decrementApiQuota() {
   }
 
   try {
-    var sheet = _getConfigSheet();
-
-    // Re-read inside the lock for freshest data
-    var rows = sheet.getDataRange().getValues();
-    var rowIdx = -1;
-
-    for (var i = 1; i < rows.length; i++) {
-      if (String(rows[i][0]).trim() === QUOTA_CONFIG_KEY) {
-        rowIdx = i;
-        break;
+    // Baca ulang 2 sel DI DALAM lock (nilai terbaru) + pastikan baris belum bergeser
+    var cells = sheet.getRange(row, 1, 1, 2).getValues()[0];
+    if (String(cells[0]).trim() !== QUOTA_CONFIG_KEY) {
+      row = _findQuotaRow(sheet);
+      if (row === -1) {
+        Logger.log('[QUOTA] ✗ API_QUOTA row vanished → BLOCKING call');
+        return { exceeded: true, quota: 0 };
       }
+      cells = sheet.getRange(row, 1, 1, 2).getValues()[0];
     }
 
-    if (rowIdx === -1) {
-      // Row missing — auto-create, then block because quota is 0
-      Logger.log('[QUOTA] ✗ API_QUOTA row not found → auto-creating with 0 and blocking');
-      sheet.appendRow([QUOTA_CONFIG_KEY, 0]);
-      return { exceeded: true, quota: 0 };
-    }
-
-    var current = parseInt(rows[rowIdx][1], 10);
+    var current = parseInt(cells[1], 10);
     if (isNaN(current)) current = 0;
 
     // Hard floor: repair any negative value
     if (current < 0) {
       Logger.log('[QUOTA] ⚠ Negative quota detected (' + current + ') → repairing to 0');
-      sheet.getRange(rowIdx + 1, 2).setValue(0);
+      sheet.getRange(row, 2).setValue(0);
       SpreadsheetApp.flush();
       return { exceeded: true, quota: 0 };
     }
 
     if (current === 0) {
-      Logger.log('[QUOTA] ✗ Quota exhausted (0) → blocking "' + QUOTA_CONFIG_KEY + '"');
+      Logger.log('[QUOTA] ✗ Quota exhausted (0) → blocking');
       return { exceeded: true, quota: 0 };
     }
 
     var next = current - 1;   // guaranteed ≥ 0 because current ≥ 1
-    sheet.getRange(rowIdx + 1, 2).setValue(next);
+    sheet.getRange(row, 2).setValue(next);
     SpreadsheetApp.flush();   // force immediate write before releasing lock
 
     Logger.log('[QUOTA] ✓ Decremented: ' + current + ' → ' + next);
@@ -232,6 +245,38 @@ function _decrementApiQuota() {
   } finally {
     try { lock.releaseLock(); } catch (e) { /* ignore */ }
   }
+}
+
+/**
+ * Cari nomor baris (1-based) key API_QUOTA. Hanya membaca kolom A.
+ * Hasil di-hint ke CacheService supaya request berikutnya cukup memverifikasi 1 baris.
+ * @returns {number} nomor baris, atau -1 bila belum ada
+ */
+function _findQuotaRow(sheet) {
+  var cache = null, hint = -1;
+  try {
+    cache = CacheService.getScriptCache();
+    var h = cache.get('quota:row');
+    if (h) hint = parseInt(h, 10);
+  } catch (e) { cache = null; }
+
+  if (hint > 1) {
+    try {
+      if (String(sheet.getRange(hint, 1).getValue()).trim() === QUOTA_CONFIG_KEY) return hint;
+    } catch (e) { /* hint di luar jangkauan sheet → scan */ }
+  }
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow >= 2) {
+    var colA = sheet.getRange(1, 1, lastRow, 1).getValues();
+    for (var i = 1; i < colA.length; i++) {
+      if (String(colA[i][0]).trim() === QUOTA_CONFIG_KEY) {
+        if (cache) { try { cache.put('quota:row', String(i + 1), 21600); } catch (e) {} }
+        return i + 1;
+      }
+    }
+  }
+  return -1;
 }
 
 // ── MIDDLEWARE WRAPPER ────────────────────────────────────────────────

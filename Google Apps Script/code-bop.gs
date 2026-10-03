@@ -142,10 +142,266 @@ const SHEETS = {
   AUTO_PAYMENT_NOMINAL: 'AutoPaymentNominal'
 };
 
+// ======================================================================
+// ===== PERFORMANCE LAYER (v6) =========================================
+// ======================================================================
+// 1. _sheetValues()  : baca sheet SEKALI per eksekusi (memo) — dipakai jalur baca.
+// 2. Cache lintas-eksekusi (CacheService) untuk aksi get* + invalidasi versi per grup
+//    sheet saat ada aksi tulis. Bila cache gagal/kosong → otomatis baca dari sheet.
+// 3. getBopBootstrap : 1 request menggantikan 6–8 request saat dashboard dibuka.
+//
+// Keamanan data: cache hanya menyimpan respons SUKSES yang sama persis dengan hasil
+// pembacaan sheet; setiap aksi tulis menaikkan versi grup terkait sehingga cache lama
+// tidak pernah dipakai lagi. TTL 90 detik membatasi umur data bila sheet diedit manual.
+// ======================================================================
+
+var _BOP_CACHE_TTL   = 90;      // detik
+var _BOP_CACHE_CHUNK = 90000;   // karakter base64 per kunci (batas CacheService 100 KB)
+var _BOP_CACHE_MAXCH = 40;      // lebih dari ini → tidak di-cache
+
+// Jumlah kolom minimum per sheet (getDataRange bisa lebih sempit bila kolom ujung kosong)
+var _SHEET_MIN_COLS = { 'Budget': 8, 'RPD': 10, 'Realisasi': 16, 'Config': 2,
+                        'AutoPaymentConfig': 3, 'AutoPaymentNominal': 5 };
+
+// ── Memo pembacaan sheet (per eksekusi) ───────────────────────────────
+var _MEMO = { on: false, depth: 0, vals: {} };
+function _memoStart() { _MEMO.on = true; _MEMO.vals = {}; }                 // dipakai di dalam lock penulisan
+function _memoStop()  { _MEMO.on = false; _MEMO.vals = {}; _MEMO.depth = 0; }
+function _memoEnter() { if (_MEMO.depth === 0) { _MEMO.on = true; _MEMO.vals = {}; } _MEMO.depth++; }
+function _memoLeave() { _MEMO.depth = Math.max(0, _MEMO.depth - 1); if (_MEMO.depth === 0) { _MEMO.on = false; _MEMO.vals = {}; } }
+
+function _readAllValues(sh) {
+  var lr = sh.getLastRow(), lc = sh.getLastColumn();
+  if (lr < 1 || lc < 1) return [];
+  var minCols = _SHEET_MIN_COLS[sh.getName()] || 0;
+  var width = Math.max(lc, Math.min(minCols, sh.getMaxColumns()));
+  return sh.getRange(1, 1, lr, width).getValues();
+}
+
+/** Semua nilai sheet (header + data). createHeaders → buat sheet bila belum ada. */
+function _sheetValues(sheetName, createHeaders) {
+  if (_MEMO.on && _MEMO.vals[sheetName]) return _MEMO.vals[sheetName];
+  var sh = createHeaders ? getOrCreateSheet(sheetName, createHeaders) : getSheet(sheetName);
+  var v = _readAllValues(sh);
+  if (_MEMO.on) _MEMO.vals[sheetName] = v;
+  return v;
+}
+
+/** Seperti _sheetValues tapi mengembalikan null bila sheet tidak ada (tanpa membuatnya). */
+function _sheetValuesIfExists(sheetName) {
+  if (_MEMO.on && _MEMO.vals[sheetName]) return _MEMO.vals[sheetName];
+  var sh = _getSS().getSheetByName(sheetName);
+  if (!sh) return null;
+  var v = _readAllValues(sh);
+  if (_MEMO.on) _MEMO.vals[sheetName] = v;
+  return v;
+}
+
+// ── Peta ketergantungan cache ─────────────────────────────────────────
+var _BOP_READ_DEPS = {
+  getBudgets:                ['budget', 'rpd', 'realisasi'],
+  getDashboardStats:         ['budget', 'rpd', 'realisasi'],
+  getRPDs:                   ['rpd'],
+  getRealisasis:             ['realisasi'],
+  getRPDConfig:              ['config'],
+  getAutoPaymentConfig:      ['ap'],
+  getAutoPaymentNominal:     ['ap'],
+  getAutoPaymentNominalYear: ['ap']
+};
+// Aksi tulis → grup yang harus di-invalidasi. (uploadFile tidak mengubah sheet.)
+var _BOP_WRITE_GROUPS = {
+  saveRealisasi:          ['realisasi'],
+  updateRealisasiStatus:  ['realisasi'],
+  verifyRealisasi:        ['realisasi'],
+  deleteRealisasi:        ['realisasi'],
+  saveRPD:                ['rpd'],
+  deleteRPD:              ['rpd'],
+  saveBudget:             ['budget'],
+  deleteBudget:           ['budget'],
+  saveRPDConfig:          ['config'],
+  updateRPDConfig:        ['config'],
+  saveAutoPaymentConfig:  ['ap'],
+  saveAutoPaymentNominal: ['ap']
+};
+
+function _bopVersions(groups) {
+  var cache = CacheService.getScriptCache();
+  var keys = groups.map(function(g) { return 'bopv:' + g; });
+  var got = cache.getAll(keys), out = [], add = {}, any = false;
+  keys.forEach(function(k) {
+    var v = got[k];
+    if (!v) { v = String(Date.now()); add[k] = v; any = true; }
+    out.push(v);
+  });
+  if (any) cache.putAll(add, 21600);
+  return out.join('.');
+}
+
+function _bopBump(groups) {
+  var stamp = String(Date.now()) + String(Math.floor(Math.random() * 1000));
+  var o = {};
+  groups.forEach(function(g) { o['bopv:' + g] = stamp; });
+  CacheService.getScriptCache().putAll(o, 21600);
+}
+
+/** Dipanggil dari doPost() setelah aksi tulis selesai. */
+function _bopInvalidateForAction(action) {
+  var groups = _BOP_WRITE_GROUPS[action];
+  if (!groups) return;
+  _bopBump(groups);
+  Logger.log('[CACHE] Invalidated ' + groups.join(',') + ' after ' + action);
+}
+
+function _stableStringify(o) {
+  if (o === null || typeof o !== 'object') return JSON.stringify(o);
+  if (Array.isArray(o)) return '[' + o.map(_stableStringify).join(',') + ']';
+  return '{' + Object.keys(o).sort().map(function(k) {
+    return JSON.stringify(k) + ':' + _stableStringify(o[k]);
+  }).join(',') + '}';
+}
+
+function _md5Hex(str) {
+  var bytes = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, str, Utilities.Charset.UTF_8);
+  return bytes.map(function(b) { return ('0' + ((b < 0 ? b + 256 : b)).toString(16)).slice(-2); }).join('');
+}
+
+function _cachePutJson(key, obj) {
+  var json = JSON.stringify(obj);
+  var gz   = Utilities.gzip(Utilities.newBlob(json, 'text/plain', 'd.txt'));
+  var b64  = Utilities.base64Encode(gz.getBytes());
+  var n    = Math.ceil(b64.length / _BOP_CACHE_CHUNK) || 1;
+  if (n > _BOP_CACHE_MAXCH) { Logger.log('[CACHE] Skip (terlalu besar): ' + key); return; }
+  var puts = {};
+  for (var i = 0; i < n; i++) {
+    puts[key + ':' + i] = (i === 0 ? (n + '|') : '') + b64.substr(i * _BOP_CACHE_CHUNK, _BOP_CACHE_CHUNK);
+  }
+  CacheService.getScriptCache().putAll(puts, _BOP_CACHE_TTL);
+}
+
+function _cacheGetJson(key) {
+  var cache = CacheService.getScriptCache();
+  var first = cache.get(key + ':0');
+  if (!first) return undefined;
+  var bar = first.indexOf('|');
+  var n = parseInt(first.substr(0, bar), 10);
+  var b64 = first.substr(bar + 1);
+  if (n > 1) {
+    var keys = [];
+    for (var i = 1; i < n; i++) keys.push(key + ':' + i);
+    var rest = cache.getAll(keys);
+    for (var j = 1; j < n; j++) {
+      var p = rest[key + ':' + j];
+      if (p === null || p === undefined) return undefined;   // chunk hilang/evicted → hitung ulang
+      b64 += p;
+    }
+  }
+  var blob = Utilities.newBlob(Utilities.base64Decode(b64), 'application/x-gzip', 'd.gz');
+  return JSON.parse(Utilities.ungzip(blob).getDataAsString());
+}
+
+/** Bungkus aksi baca: cache hit → langsung; miss → hitung + simpan (hanya respons sukses). */
+function _cachedRead(action, data, computeFn) {
+  var groups = _BOP_READ_DEPS[action];
+  if (!groups) return computeFn();
+  var key = null;
+  try {
+    var params = {};
+    Object.keys(data || {}).forEach(function(k) {
+      if (k !== 'action' && k.charAt(0) !== '_') params[k] = data[k];
+    });
+    key = 'bopc:' + action + ':' + _md5Hex(_stableStringify(params)) + ':' + _bopVersions(groups);
+    var hit = _cacheGetJson(key);
+    if (hit !== undefined) { Logger.log('[CACHE] HIT  ' + action); return hit; }
+  } catch (e) {
+    Logger.log('[CACHE] read error (' + action + '): ' + e);
+    key = null;
+  }
+  var result = computeFn();
+  try {
+    if (key && result && result.success === true) { _cachePutJson(key, result); Logger.log('[CACHE] MISS ' + action + ' → stored'); }
+  } catch (e) { Logger.log('[CACHE] write error (' + action + '): ' + e); }
+  return result;
+}
+
+/** Ringkasan payload untuk log (tanpa base64 / data besar). */
+function _logSummary(data) {
+  var o = {};
+  Object.keys(data || {}).forEach(function(k) {
+    var v = data[k];
+    if (k === 'fileData') o[k] = '[base64 ' + (v ? v.length : 0) + ' chars]';
+    else if (typeof v === 'string' && v.length > 120) o[k] = v.substr(0, 120) + '…';
+    else if (v && typeof v === 'object') o[k] = Array.isArray(v) ? '[array ' + v.length + ']' : '[object]';
+    else o[k] = v;
+  });
+  var s = JSON.stringify(o);
+  return s.length > 600 ? s.substr(0, 600) + '…' : s;
+}
+
+// ── BOOTSTRAP: semua data awal dashboard dalam SATU request ────────────
+function getBopBootstrap(data) {
+  var t0 = Date.now();
+  var role = data.role, kua = data.kua;
+  var year = parseInt(data.year, 10) || new Date().getFullYear();
+  var isAdmin = (role === 'Admin');
+  var out = {}, failed = [];
+
+  function pick(name, action, params) {
+    try {
+      var r = handleBOPAction(action, params);        // memakai cache + memo yang sama dgn request tunggal
+      if (r && r.success) out[name] = r.data; else failed.push(name);
+    } catch (e) {
+      Logger.log('[BOOTSTRAP] ' + name + ' error: ' + e);
+      failed.push(name);
+    }
+  }
+
+  // Parameter SENGAJA identik dengan yang dipakai client pada pemanggilan tunggal
+  pick('stats',      'getDashboardStats',         { year: year, kua: kua, role: role });
+  pick('budgets',    'getBudgets',                isAdmin ? { year: year } : { kua: kua });
+  pick('config',     'getRPDConfig',              {});
+  if (!isAdmin) {
+    pick('rpds',       'getRPDs',                 { kua: kua, year: year });
+    pick('realisasis', 'getRealisasis',           { kua: kua, year: year });
+  }
+  pick('apConfig',   'getAutoPaymentConfig',      {});
+  pick('apNominals', 'getAutoPaymentNominalYear', { year: year });
+
+  out._failed = failed;
+  out._year = year;
+  Logger.log('[BOOTSTRAP] ' + (isAdmin ? 'Admin' : kua) + ' done in ' + (Date.now() - t0) + ' ms, failed=' + failed.join(',') );
+  return successResponse(out);
+}
+
+// ── Folder upload: cache ID folder bulan berjalan ─────────────────────
+function _getUploadMonthFolder(year, month) {
+  var cache = CacheService.getScriptCache();
+  var ck = 'bopu:' + year + '-' + month;
+  var id = cache.get(ck);
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) { /* folder dihapus → buat ulang */ } }
+
+  var lock = null, locked = false;
+  try { lock = LockService.getUserLock(); locked = lock.tryLock(10000); } catch (e) { locked = false; }
+  try {
+    id = cache.get(ck);                                  // cek ulang: request lain mungkin baru membuatnya
+    if (id) { try { return DriveApp.getFolderById(id); } catch (e) {} }
+
+    var rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+    function child(parent, name) {
+      var it = parent.getFoldersByName(name);
+      return it.hasNext() ? it.next() : parent.createFolder(name);
+    }
+    var folder = child(child(child(rootFolder, 'BOP_Uploads'), String(year)), month);
+    cache.put(ck, folder.getId(), 21600);
+    return folder;
+  } finally {
+    if (locked) { try { lock.releaseLock(); } catch (e) {} }
+  }
+}
+
 // ===== AUTO PAYMENT SHEET HELPER =====
 function getOrCreateSheet(sheetName, headers) {
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const ss = _getSS();
     let sheet = ss.getSheetByName(sheetName);
     if (!sheet) {
       sheet = ss.insertSheet(sheetName);
@@ -165,16 +421,7 @@ function getOrCreateSheet(sheetName, headers) {
 // ===== HELPER FUNCTIONS =====
 function getSheet(sheetName) {
   try {
-    var ss;
-    try {
-      ss = SpreadsheetApp.getActiveSpreadsheet();
-    } catch(e) {
-      // Fallback ke openById jika getActiveSpreadsheet gagal
-      var ssId = (typeof SS_ID !== 'undefined') ? SS_ID : 
-                 (typeof SPREADSHEET_ID !== 'undefined') ? SPREADSHEET_ID : null;
-      if (!ssId) throw new Error('Spreadsheet ID tidak ditemukan');
-      ss = SpreadsheetApp.openById(ssId);
-    }
+    var ss = _getSS();   // ✅ memo per eksekusi (lihat code-main.gs)
     const sheet = ss.getSheetByName(sheetName);
     if (!sheet) {
       Logger.log('[ERROR] Sheet not found: ' + sheetName);
@@ -231,10 +478,29 @@ function safeFormatDate(dateValue) {
 }
 
 // ===== MAIN HANDLER =====
+/**
+ * Pintu masuk semua aksi BOP.
+ *  - aksi baca (get*)  : memo sheet per eksekusi + cache lintas-eksekusi (_cachedRead)
+ *  - getBopBootstrap   : gabungan beberapa aksi baca dalam 1 request
+ *  - aksi tulis        : langsung ke _handleBOPActionCore (tanpa cache)
+ */
 function handleBOPAction(action, data) {
-  Logger.log('[BOP] Action: ' + action);
-  Logger.log('[BOP] Data received: ' + JSON.stringify(data));
-  
+  data = data || {};
+  Logger.log('[BOP] Action: ' + action + ' | ' + _logSummary(data));
+  var isRead = action === 'getBopBootstrap' || !!_BOP_READ_DEPS[action];
+  if (isRead) _memoEnter();
+  try {
+    if (action === 'getBopBootstrap') return getBopBootstrap(data);
+    if (_BOP_READ_DEPS[action]) {
+      return _cachedRead(action, data, function() { return _handleBOPActionCore(action, data); });
+    }
+    return _handleBOPActionCore(action, data);
+  } finally {
+    if (isRead) _memoLeave();
+  }
+}
+
+function _handleBOPActionCore(action, data) {
   try {
     let result;
     
@@ -499,6 +765,10 @@ function handleBOPAction(action, data) {
       case 'saveAutoPaymentConfig':
         result = saveAutoPaymentConfig(data);
         break;
+      case 'getAutoPaymentNominalYear':
+        result = getAutoPaymentNominalYear(data);
+        break;
+
       case 'getAutoPaymentNominal':
         result = getAutoPaymentNominal(data);
         break;
@@ -524,22 +794,38 @@ function getBudgets(data) {
   Logger.log('[GET_BUDGETS] KUA: ' + data.kua + ', Year: ' + data.year);
   
   try {
-    const sheet = getSheet(SHEETS.BUDGET);
-    const rows = sheet.getDataRange().getValues();
+    const rows     = _sheetValues(SHEETS.BUDGET);
+    const rpdRows  = _sheetValues(SHEETS.RPD);
+    const realRows = _sheetValues(SHEETS.REALISASI);
+
+    // ✅ PERFORMA: total RPD & total realisasi (Approved/Paid) per "KUA|Tahun" dihitung
+    //    SEKALI jalan. Sebelumnya calculateTotalRPD/Realisasi membaca ulang seluruh sheet
+    //    untuk SETIAP baris budget (31 KUA → ±62 pembacaan sheet penuh per request).
+    const rpdTotals = {};
+    for (let i = 1; i < rpdRows.length; i++) {
+      const k = rpdRows[i][1] + '|' + rpdRows[i][3];
+      rpdTotals[k] = (rpdTotals[k] || 0) + (parseFloat(rpdRows[i][4]) || 0);
+    }
+    const realTotals = {};
+    for (let i = 1; i < realRows.length; i++) {
+      const st = normalizeStatus(realRows[i][8]);
+      if (st === 'Approved' || st === 'Paid') {
+        const k = realRows[i][1] + '|' + realRows[i][4];
+        realTotals[k] = (realTotals[k] || 0) + (parseFloat(realRows[i][5]) || 0);
+      }
+    }
+
     const budgets = [];
-    
-    Logger.log('[GET_BUDGETS] Total rows: ' + rows.length);
-    
     for (let i = 1; i < rows.length; i++) {
       if ((!data.kua || rows[i][1] === data.kua) && 
           (!data.year || rows[i][2] == data.year)) {
         
-        // ✅ Hitung totalRPD dan totalRealisasi dari sheet lain
         const kua = rows[i][1];
         const year = rows[i][2];
+        const key = kua + '|' + year;
         
-        const totalRPD = calculateTotalRPD(kua, year);
-        const totalRealisasi = calculateTotalRealisasi(kua, year);
+        const totalRPD = rpdTotals[key] || 0;
+        const totalRealisasi = realTotals[key] || 0;
         const budgetTotal = parseFloat(rows[i][3]) || 0;
         
         budgets.push({
@@ -569,8 +855,7 @@ function getBudgets(data) {
 
 function calculateTotalRealisasi(kua, year) {
   try {
-    const sheet = getSheet(SHEETS.REALISASI);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.REALISASI);
     let total = 0;
     
     for (let i = 1; i < rows.length; i++) {
@@ -589,8 +874,7 @@ function calculateTotalRealisasi(kua, year) {
 
 function calculateTotalRPD(kua, year) {
   try {
-    const sheet = getSheet(SHEETS.RPD);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.RPD);
     let total = 0;
     
     for (let i = 1; i < rows.length; i++) {
@@ -695,8 +979,7 @@ function getRPDs(data) {
   Logger.log('[GET_RPDS] KUA: ' + data.kua + ', Year: ' + data.year);
   
   try {
-    const sheet = getSheet(SHEETS.RPD);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.RPD);
     const rpds = [];
     
     Logger.log('[GET_RPDS] Total rows: ' + rows.length);
@@ -823,11 +1106,12 @@ function deleteRPD(data) {
 
 // ===== REALISASI MANAGEMENT =====
 function getRealisasis(data) {
-  Logger.log('[GET_REALISASIS] KUA: ' + data.kua + ', Year: ' + data.year);
+  const _t0 = Date.now();
+  Logger.log('[GET_REALISASIS] KUA: ' + data.kua + ', Year: ' + data.year + ', Month: ' + data.month);
   
   try {
-    const sheet = getSheet(SHEETS.REALISASI);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.REALISASI);
+    if (rows.length < 2) return successResponse([]);
     const realisasis = [];
     
     Logger.log('[GET_REALISASIS] Total rows: ' + rows.length);
@@ -841,6 +1125,7 @@ function getRealisasis(data) {
       
       // Filter by KUA and Year
       if ((!data.kua || row[1] === data.kua) && 
+          (!data.month || row[2] === data.month) &&
           (!data.year || row[4] == data.year)) {
         
         // Parse Data (JSON)
@@ -884,7 +1169,7 @@ function getRealisasis(data) {
       }
     }
     
-    Logger.log('[GET_REALISASIS] Found: ' + realisasis.length + ' realisasis');
+    Logger.log('[GET_REALISASIS] Found: ' + realisasis.length + ' realisasis, rows=' + rows.length + ', ' + (Date.now() - _t0) + ' ms');
     return successResponse(realisasis);
     
   } catch (error) {
@@ -1025,8 +1310,7 @@ function updateRealisasiStatus(data) {
         // A=ID, B=KUA, C=Bulan, D=RPD_ID, E=Tahun, F=Total, G=Data, H=Files, 
         // I=Status, J=Notes, K=CreatedAt, L=UpdatedAt, M=VerifiedAt, N=UserID, O=Username, P=VerifiedBy
         
-        sheet.getRange(i + 1, 9).setValue(data.status);           // I: Status
-        sheet.getRange(i + 1, 10).setValue(data.notes || '');     // J: Notes
+        sheet.getRange(i + 1, 9, 1, 2).setValues([[data.status, data.notes || '']]);   // I:J sekaligus (Status, Notes)
         sheet.getRange(i + 1, 13).setValue(now);                  // M: VerifiedAt
         sheet.getRange(i + 1, 16).setValue(data.verifiedBy || '');// P: VerifiedBy
         
@@ -1258,8 +1542,7 @@ function getDashboardStats(data) {
 
 function calculateTotalBudget(kua, year) {
   try {
-    const sheet = getSheet(SHEETS.BUDGET);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.BUDGET);
     
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][1] === kua && rows[i][2] == year) {
@@ -1282,8 +1565,7 @@ function getRPDConfig(data) {
   Logger.log('[GET_RPD_CONFIG] Getting config from sheet');
   
   try {
-    const configSheet = getSheet(SHEETS.CONFIG);
-    const rows = configSheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.CONFIG);
     
     const config = {};
     
@@ -1291,14 +1573,10 @@ function getRPDConfig(data) {
     for (let i = 1; i < rows.length; i++) {
       const key = rows[i][0];
       const value = rows[i][1];
-      
-      if (key) {
-        config[key] = value;
-        Logger.log('[GET_RPD_CONFIG] ' + key + ' = ' + value);
-      }
+      if (key) config[key] = value;
     }
     
-    Logger.log('[GET_RPD_CONFIG] Config loaded:', JSON.stringify(config));
+    Logger.log('[GET_RPD_CONFIG] Config loaded: ' + Object.keys(config).length + ' keys');
     return successResponse(config);
     
   } catch (error) {
@@ -2964,110 +3242,46 @@ function generateRealisasiDetailPage(realisasiByKUA, kuaList, year, pageNum, tot
 }
 
 function uploadFile(data) {
-  Logger.log('[UPLOAD_FILE] ========== START ==========');
-  Logger.log('[UPLOAD_FILE] Filename: ' + data.filename);
-  Logger.log('[UPLOAD_FILE] MIME Type: ' + data.mimeType);
+  const _t0 = Date.now();
+  Logger.log('[UPLOAD_FILE] START ' + data.filename + ' (' + data.mimeType + ')');
   
   try {
-    // Decode base64
-    const fileBlob = Utilities.newBlob(
-      Utilities.base64Decode(data.fileData),
-      data.mimeType,
-      data.filename
-    );
-    
-    Logger.log('[UPLOAD_FILE] File blob created, size: ' + fileBlob.getBytes().length);
-    
-    // Get root folder
-    const rootFolder = DriveApp.getFolderById(DRIVE_FOLDER_ID);
-    Logger.log('[UPLOAD_FILE] Root folder: ' + rootFolder.getName());
-    
-    // ✅ Create organized folder structure
-    // Format: BOP_Uploads/YYYY/MM/
+    // Decode base64 (sekali; ukuran dipakai ulang — tanpa getBytes() berulang)
+    const bytes = Utilities.base64Decode(data.fileData);
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
-    
-    Logger.log('[UPLOAD_FILE] Creating folder structure: BOP_Uploads/' + year + '/' + month);
-    
-    // Get or create "BOP_Uploads" folder
-    let uploadsFolder;
-    const uploadsFolders = rootFolder.getFoldersByName('BOP_Uploads');
-    if (uploadsFolders.hasNext()) {
-      uploadsFolder = uploadsFolders.next();
-      Logger.log('[UPLOAD_FILE] Found existing BOP_Uploads folder');
-    } else {
-      uploadsFolder = rootFolder.createFolder('BOP_Uploads');
-      Logger.log('[UPLOAD_FILE] Created new BOP_Uploads folder');
-    }
-    
-    // Get or create year folder
-    let yearFolder;
-    const yearFolders = uploadsFolder.getFoldersByName(year.toString());
-    if (yearFolders.hasNext()) {
-      yearFolder = yearFolders.next();
-      Logger.log('[UPLOAD_FILE] Found existing year folder: ' + year);
-    } else {
-      yearFolder = uploadsFolder.createFolder(year.toString());
-      Logger.log('[UPLOAD_FILE] Created new year folder: ' + year);
-    }
-    
-    // Get or create month folder
-    let monthFolder;
-    const monthFolders = yearFolder.getFoldersByName(month);
-    if (monthFolders.hasNext()) {
-      monthFolder = monthFolders.next();
-      Logger.log('[UPLOAD_FILE] Found existing month folder: ' + month);
-    } else {
-      monthFolder = yearFolder.createFolder(month);
-      Logger.log('[UPLOAD_FILE] Created new month folder: ' + month);
-    }
-    
-    // ✅ Generate unique filename
-    // Format: timestamp_originalname
-    const timestamp = Date.now();
-    const extension = data.filename.includes('.') ? 
-      data.filename.substring(data.filename.lastIndexOf('.')) : '';
-    const basename = data.filename.includes('.') ?
-      data.filename.substring(0, data.filename.lastIndexOf('.')) : data.filename;
-    
-    const uniqueFilename = timestamp + '_' + basename + extension;
-    
-    Logger.log('[UPLOAD_FILE] Unique filename: ' + uniqueFilename);
-    Logger.log('[UPLOAD_FILE] Upload path: BOP_Uploads/' + year + '/' + month + '/' + uniqueFilename);
-    
-    // Create file in month folder
+
+    // ✅ Nama unik: timestamp_namaasli
+    const uniqueFilename = Date.now() + '_' + data.filename;
+    const fileBlob = Utilities.newBlob(bytes, data.mimeType, uniqueFilename);   // nama langsung benar → tanpa file.setName()
+
+    // ✅ PERFORMA: folder BOP_Uploads/YYYY/MM di-cache ID-nya (sebelumnya 3× getFoldersByName
+    //    + hasNext/next di setiap upload). Pembuatan folder baru dilindungi lock agar upload
+    //    paralel di awal bulan tidak membuat folder dobel.
+    const monthFolder = _getUploadMonthFolder(year, month);
+
     const file = monthFolder.createFile(fileBlob);
-    file.setName(uniqueFilename);
-    file.setDescription('Uploaded: ' + now.toISOString() + '\nOriginal: ' + data.filename);
-    
-    // Set sharing to anyone with link can view
-    // Wrapped in try/catch — sharing permission may be restricted by org policy,
-    // but the file is already uploaded so we should NOT fail the whole request.
+
+    // Sharing "anyone with link": jangan gagalkan upload bila kebijakan organisasi melarang
     try {
       file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-      Logger.log('[UPLOAD_FILE] Sharing set to ANYONE_WITH_LINK');
     } catch (sharingError) {
       Logger.log('[UPLOAD_FILE] WARNING: Could not set sharing: ' + sharingError.toString());
-      Logger.log('[UPLOAD_FILE] File is uploaded but sharing could not be set. Continuing...');
     }
-    
+
     const fileId = file.getId();
     const fileUrl = file.getUrl();
-    const fileSize = file.getSize();
-    
-    Logger.log('[UPLOAD_FILE] ✅ File uploaded successfully');
-    Logger.log('[UPLOAD_FILE] File ID: ' + fileId);
-    Logger.log('[UPLOAD_FILE] File URL: ' + fileUrl);
-    Logger.log('[UPLOAD_FILE] File Size: ' + fileSize + ' bytes');
-    
+
+    Logger.log('[UPLOAD_FILE] ✅ ' + uniqueFilename + ' | ' + bytes.length + ' bytes | ' + (Date.now() - _t0) + ' ms');
+
     return successResponse({
       id: fileId,
       name: uniqueFilename,           // ✅ Unique name
       originalName: data.filename,    // ✅ Original name
       url: fileUrl,
       mimeType: data.mimeType,
-      size: fileSize,
+      size: bytes.length,
       uploadPath: 'BOP_Uploads/' + year + '/' + month + '/' + uniqueFilename
     });
     
@@ -3077,6 +3291,7 @@ function uploadFile(data) {
     return errorResponse('Gagal upload file: ' + error.toString());
   }
 }
+
 
 function updateRPDConfig(data) {
   Logger.log('[UPDATE_RPD_CONFIG] Updating configuration...');
@@ -3153,8 +3368,7 @@ var AP_POS_CODES = ['522111', '522112'];
 function getAutoPaymentConfig(data) {
   Logger.log('[GET_AP_CONFIG] Loading Auto Payment Config');
   try {
-    const sheet = getOrCreateSheet(SHEETS.AUTO_PAYMENT_CONFIG, AP_CONFIG_HEADERS);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.AUTO_PAYMENT_CONFIG, AP_CONFIG_HEADERS);
     const config = {};
 
     for (var i = 1; i < rows.length; i++) {
@@ -3217,8 +3431,7 @@ function saveAutoPaymentConfig(data) {
 function getAutoPaymentNominal(data) {
   Logger.log('[GET_AP_NOMINAL] Month: ' + data.month + ', Year: ' + data.year);
   try {
-    const sheet = getOrCreateSheet(SHEETS.AUTO_PAYMENT_NOMINAL, AP_NOMINAL_HEADERS);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.AUTO_PAYMENT_NOMINAL, AP_NOMINAL_HEADERS);
     const result = {};
 
     for (var i = 1; i < rows.length; i++) {
@@ -3242,6 +3455,40 @@ function getAutoPaymentNominal(data) {
   } catch (error) {
     Logger.log('[GET_AP_NOMINAL ERROR] ' + error.toString());
     return errorResponse('Gagal memuat Auto Payment Nominal: ' + error.toString());
+  }
+}
+
+// ------------------------------------------------------------------
+// GET NOMINAL SETAHUN (1 request menggantikan 12 request per bulan)
+// data.year → returns { 'Januari': { kua: {'522111': n, '522112': n} }, 'Februari': {...}, ... }
+// ------------------------------------------------------------------
+function getAutoPaymentNominalYear(data) {
+  Logger.log('[GET_AP_NOMINAL_YEAR] Year: ' + data.year);
+  try {
+    const rows = _sheetValues(SHEETS.AUTO_PAYMENT_NOMINAL, AP_NOMINAL_HEADERS);
+    const result = {};
+
+    for (var i = 1; i < rows.length; i++) {
+      var kua = rows[i][0];
+      var month = rows[i][1];
+      var year = rows[i][2];
+      if (!kua || !month) continue;
+      if (data.year && year != data.year) continue;
+
+      if (!result[month]) result[month] = {};
+      result[month][kua] = {
+        '522111': parseFloat(rows[i][3]) || 0,
+        '522112': parseFloat(rows[i][4]) || 0,
+        month: month,
+        year: year
+      };
+    }
+
+    Logger.log('[GET_AP_NOMINAL_YEAR] Months with data: ' + Object.keys(result).length);
+    return successResponse(result);
+  } catch (error) {
+    Logger.log('[GET_AP_NOMINAL_YEAR ERROR] ' + error.toString());
+    return errorResponse('Gagal memuat Auto Payment Nominal (tahunan): ' + error.toString());
   }
 }
 
@@ -3339,16 +3586,14 @@ function calculateAutoPaymentTotal(realisasis, apConfig, apNominalByKua, mode) {
 function _loadAPData(year) {
   var apCfg = {}, apNom = {};
   try {
-    var cs = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEETS.AUTO_PAYMENT_CONFIG);
-    if (cs) {
-      var cr = cs.getDataRange().getValues();
+    var cr = _sheetValuesIfExists(SHEETS.AUTO_PAYMENT_CONFIG);
+    if (cr) {
       for (var i = 1; i < cr.length; i++) {
         if (cr[i][0]) apCfg[cr[i][0]] = { '522111': cr[i][1]===true||cr[i][1]==='TRUE', '522112': cr[i][2]===true||cr[i][2]==='TRUE' };
       }
     }
-    var ns = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEETS.AUTO_PAYMENT_NOMINAL);
-    if (ns) {
-      var nr = ns.getDataRange().getValues();
+    var nr = _sheetValuesIfExists(SHEETS.AUTO_PAYMENT_NOMINAL);
+    if (nr) {
       for (var j = 1; j < nr.length; j++) {
         var nk = nr[j][0], nm = nr[j][1], ny = nr[j][2];
         if (nk && ny == year) {
