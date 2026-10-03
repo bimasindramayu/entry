@@ -267,8 +267,92 @@ window.addEventListener('DOMContentLoaded', function() {
 });
 
 // ✅ PRELOAD ALL DATA - dipanggil sekali saat dashboard pertama kali muncul
+// ✅ PERFORMA: seluruh data awal dashboard diambil dengan SATU request (getBopBootstrap).
+// Sebelumnya 5–8 request terpisah per login (Operator) — kini 1 eksekusi Apps Script.
+// Bila backend belum diperbarui atau ada bagian penting yang gagal → return false
+// sehingga preloadAllData() jatuh ke jalur lama (_preloadAllDataLegacy).
+async function _preloadViaBootstrap() {
+    const currentYear = new Date().getFullYear();
+    const isAdmin = currentUser.role === 'Admin';
+    let boot;
+    try {
+        boot = await apiCall('getBopBootstrap', {
+            year: currentYear, kua: currentUser.kua, role: currentUser.role,
+            _tries: 2, _silent: true
+        });
+    } catch (e) {
+        console.warn('[PRELOAD] Bootstrap tidak tersedia, memakai jalur lama:', e.message);
+        return false;
+    }
+    if (!boot || typeof boot !== 'object') return false;
+
+    const failed = new Set(boot._failed || []);
+    const required = isAdmin ? ['stats', 'budgets', 'config']
+                             : ['stats', 'budgets', 'config', 'rpds', 'realisasis'];
+    if (required.some(k => failed.has(k) || boot[k] === undefined)) {
+        console.warn('[PRELOAD] Bootstrap tidak lengkap, memakai jalur lama. Gagal:', Array.from(failed));
+        return false;
+    }
+
+    // Isi cache sesi + SmartCache dengan parameter yang SAMA seperti pemanggilan tunggal
+    const statsParams = { year: currentYear, kua: currentUser.kua, role: currentUser.role };
+    updateLocalCache('dashboardStats', boot.stats);
+    apiPrimeCache('getDashboardStats', statsParams, boot.stats);
+
+    updateLocalCache('budgets', boot.budgets);
+    apiPrimeCache('getBudgets', isAdmin ? { year: currentYear } : { kua: currentUser.kua }, boot.budgets);
+
+    updateLocalCache('config', boot.config);
+    apiPrimeCache('getRPDConfig', {}, boot.config);
+
+    if (!isAdmin) {
+        apiPrimeCache('getRPDs', { kua: currentUser.kua, year: currentYear }, boot.rpds);
+        updateLocalCache('rpds', sortByMonth(boot.rpds));
+        apiPrimeCache('getRealisasis', { kua: currentUser.kua, year: currentYear }, boot.realisasis);
+        updateLocalCache('realisasis', sortByMonth(boot.realisasis));
+    }
+
+    // Auto Payment (opsional — dilengkapi oleh preloadAllData bila kosong)
+    if (!failed.has('apConfig') && boot.apConfig) _apConfig = boot.apConfig;
+    if (!failed.has('apNominals') && boot.apNominals) {
+        _AP_MONTHS.forEach(m => { _apNominals[`${m}_${currentYear}`] = boot.apNominals[m] || {}; });
+    }
+
+    console.log('[PRELOAD] ✅ Bootstrap OK (1 request)');
+    return true;
+}
+
 async function preloadAllData() {
-    console.log('[PRELOAD] ========== PRELOADING ALL DATA START ==========');
+    console.log('[PRELOAD] ========== PRELOADING ALL DATA START (bootstrap) ==========');
+    console.log('[PRELOAD] User:', currentUser.role, '-', currentUser.kua);
+
+    showLoading();
+    try {
+        const ok = await _preloadViaBootstrap();
+        if (ok) {
+            // Lengkapi Auto Payment bila bootstrap tidak membawanya
+            try {
+                const y = new Date().getFullYear();
+                if (_apConfig === null) await apGetConfig();
+                if (!_apNominals[`${_AP_MONTHS[new Date().getMonth()]}_${y}`]) await apPreloadYear(y, []);
+            } catch (apErr) {
+                console.warn('[PRELOAD] AP preload error (non-fatal):', apErr);
+            }
+            console.log('[PRELOAD] ========== ALL DATA LOADED SUCCESSFULLY ==========');
+        } else {
+            await _preloadAllDataLegacy();
+        }
+    } catch (error) {
+        console.error('[PRELOAD] Error loading data:', error);
+        showNotification('Gagal memuat data: ' + error.message, 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+// Jalur lama (multi-request) — hanya dipakai sebagai cadangan bila bootstrap gagal.
+async function _preloadAllDataLegacy() {
+    console.log('[PRELOAD] ========== PRELOADING ALL DATA START (legacy) ==========');
     console.log('[PRELOAD] User:', currentUser.role, '-', currentUser.kua);
     
     showLoading();
@@ -377,26 +461,13 @@ async function preloadAllData() {
             await apGetConfig();
             console.log('[PRELOAD] ✅ AP Config preloaded');
             
-            // Preload AP Nominal untuk bulan-bulan yang ada di realisasi cache
+            // ✅ Nominal SAKTI setahun dimuat dengan SATU request (sebelumnya 12 request paralel
+            //    per login → melampaui batas eksekusi bersamaan Apps Script → 404/timeout).
             const _cachedReal = getLocalCache('realisasis') || [];
-            const _monthKeys = new Set();
-            _cachedReal.forEach(r => { if (r.month && r.year) _monthKeys.add(`${r.month}|${r.year}`); });
-            
-            // Preload SEMUA 12 bulan untuk tahun saat ini (agar Tambah Realisasi tidak hit API)
-            const _now = new Date();
-            const _curYear = _now.getFullYear();
-            const _monthNames = ['Januari','Februari','Maret','April','Mei','Juni',
-                                 'Juli','Agustus','September','Oktober','November','Desember'];
-            // Tambah semua 12 bulan tahun ini
-            _monthNames.forEach(m => _monthKeys.add(`${m}|${_curYear}`));
-            
-            const _nomPromises = [];
-            _monthKeys.forEach(mk => {
-                const [_m, _y] = mk.split('|');
-                _nomPromises.push(apGetNominals(_m, parseInt(_y)));
-            });
-            await Promise.all(_nomPromises);
-            console.log('[PRELOAD] ✅ AP Nominals preloaded for', _monthKeys.size, 'month(s) (all 12 months of', _curYear, ')');
+            const _usedMonths = _cachedReal.map(r => r.month).filter(Boolean);
+            const _curYear = new Date().getFullYear();
+            await apPreloadYear(_curYear, _usedMonths);
+            console.log('[PRELOAD] ✅ AP Nominals preloaded for year', _curYear);
         } catch (_apErr) {
             console.warn('[PRELOAD] AP preload error (non-fatal):', _apErr);
         }
@@ -3413,50 +3484,49 @@ async function showRealisasiModal(realisasi = null) {
             }
         }
         
-        // 2. Upload new files
+        // 2. Upload new files — ✅ PARALEL (antrian client membatasi 4 request bersamaan;
+        //    sebelumnya satu per satu sehingga 5 file = 5× waktu tunggu)
         if (uploadedFiles.length > 0) {
-            console.log('[REALISASI FORM] Uploading new files:', uploadedFiles.length);
-            
-            for (let i = 0; i < uploadedFiles.length; i++) {
-                const file = uploadedFiles[i];
-                console.log('[REALISASI FORM] Uploading file', (i + 1), ':', file.fileName);
-                
-                try {
-                    const uploadResult = await apiCall('uploadFile', {
-                        filename: file.fileName,
-                        fileData: file.fileData,
-                        mimeType: file.mimeType
-                    });
-                    
-                    console.log('[REALISASI FORM] File uploaded:', uploadResult);
-                    
-                    // ✅ Build proper file object
-                    const fileObj = {
-                        fileId: uploadResult.id || uploadResult.fileId || '',
-                        fileName: uploadResult.originalName || file.fileName,
-                        uniqueName: uploadResult.name || file.fileName,
-                        fileUrl: uploadResult.url || uploadResult.fileUrl || '',
-                        mimeType: uploadResult.mimeType || file.mimeType,
-                        size: uploadResult.fileSize || file.fileSize || 0,
-                        uploadPath: uploadResult.uploadPath || ''
-                    };
-                    
-                    console.log('[REALISASI FORM] File object:', fileObj);
-                    
-                    // Validate
-                    if (fileObj.fileName && fileObj.fileUrl) {
-                        allFiles.push(fileObj);
-                        console.log('[REALISASI FORM] File added to array');
-                    } else {
-                        console.error('[REALISASI FORM] Invalid file object:', fileObj);
+            console.log('[REALISASI FORM] Uploading new files (parallel):', uploadedFiles.length);
+
+            let uploads;
+            try {
+                uploads = await Promise.all(uploadedFiles.map(async (file) => {
+                    try {
+                        const r = await apiCall('uploadFile', {
+                            filename: file.fileName,
+                            fileData: file.fileData,
+                            mimeType: file.mimeType
+                        });
+                        return { file: file, uploadResult: r };
+                    } catch (err) {
+                        err.failedFileName = file.fileName;
+                        throw err;
                     }
-                    
-                } catch (error) {
-                    console.error('[REALISASI FORM] Upload error:', error);
-                    showNotification('Gagal upload file: ' + file.fileName, 'error');
-                    return;
-                }
+                }));
+            } catch (error) {
+                console.error('[REALISASI FORM] Upload error:', error);
+                showNotification('Gagal upload file: ' + (error.failedFileName || ''), 'error');
+                return;
             }
+
+            // Urutan hasil = urutan file yang dipilih user
+            uploads.forEach(({ file, uploadResult }) => {
+                const fileObj = {
+                    fileId: uploadResult.id || uploadResult.fileId || '',
+                    fileName: uploadResult.originalName || file.fileName,
+                    uniqueName: uploadResult.name || file.fileName,
+                    fileUrl: uploadResult.url || uploadResult.fileUrl || '',
+                    mimeType: uploadResult.mimeType || file.mimeType,
+                    size: uploadResult.fileSize || uploadResult.size || file.fileSize || 0,
+                    uploadPath: uploadResult.uploadPath || ''
+                };
+                if (fileObj.fileName && fileObj.fileUrl) {
+                    allFiles.push(fileObj);
+                } else {
+                    console.error('[REALISASI FORM] Invalid file object:', fileObj);
+                }
+            });
         }
         
         console.log('[REALISASI FORM] Total files to submit:', allFiles.length);
@@ -3504,9 +3574,8 @@ async function showRealisasiModal(realisasi = null) {
             // Close modal dengan benar
             closeRealisasiModal();
             
-            // Reload data
-            await loadRealisasis(true);
-            await loadDashboardStats(true);
+            // Reload data — ✅ paralel (sebelumnya berurutan)
+            await Promise.all([loadRealisasis(true), loadDashboardStats(true)]);
             
         } catch (error) {
             console.error('[REALISASI FORM ERROR]', error);
@@ -5253,10 +5322,12 @@ function viewRealisasi(realisasiId) {
             background:#f7f8ff;
             transition: left .3s ease, width .3s ease, top .3s ease, bottom .3s ease,
                         transform .3s ease, border-radius .3s ease, box-shadow .3s ease;
-            left:0; top:0; bottom:0; width:42%;
-            border-right:1px solid #e0e4f0;
-            box-shadow:4px 0 20px rgba(0,0,0,.15);
-            border-radius:0;
+            left:50%; top:50%; bottom:auto; width:min(860px, 92vw);
+            height:min(92vh, 920px); max-height:92vh;
+            transform:translateX(-50%) translateY(-50%);
+            border-right:none;
+            box-shadow:0 24px 64px rgba(0,0,0,.35);
+            border-radius:16px;
         ">
             <!-- Header gradient -->
             <div style="
@@ -5427,7 +5498,8 @@ function viewRealisasi(realisasiId) {
         previewer.open(f.fileUrl, _dName);
     }
 
-    // Bind preview buttons/cards + auto-open first file
+    // Bind preview buttons/cards. Preview dokumen HANYA dibuka saat user klik file/tombol Lihat
+    // (tidak lagi otomatis membuka file pertama saat Detail Realisasi dibuka).
     setTimeout(() => {
         modal.querySelectorAll('._dpViewPreviewBtn').forEach(function(btn) {
             btn.addEventListener('click', function(e) {
@@ -5443,13 +5515,8 @@ function viewRealisasi(realisasiId) {
             });
         });
 
-        if (_viewFilesList.length > 0) {
-            // Auto-open first file → starts in split mode
-            _dpViewOpenFile(0);
-        } else {
-            // No files → start in center mode
-            window._viewRlsSwitchToCenter();
-        }
+        // Mulai selalu di mode tengah; mode split baru aktif setelah user memilih sebuah file
+        window._viewRlsSwitchToCenter();
     }, 150);
 
     // Async: inject RPD detail + AP summary
@@ -7300,7 +7367,7 @@ function startVerifikasiAutoRefresh() {
             const year = yearFilter ? parseInt(yearFilter.value) : new Date().getFullYear();
             
             try {
-                const freshData = await apiCall('getRealisasis', { year: year });
+                const freshData = await getRealisasisResilient({ year: year });
                 
                 // Count pending verifications
                 const oldPending = cachedData.realisasis.filter(r => normalizeStatus(r.status) === STATUS.WAITING).length;
@@ -8830,6 +8897,37 @@ function sortRPDTable(columnIndex) {
 }
 
 // ===== VERIFIKASI: LOAD DATA WITH FILTERS =====
+// ✅ Ambil realisasi (Admin: semua KUA) dengan fallback bila request besar gagal.
+// Latar belakang: getRealisasis tanpa filter KUA mengembalikan seluruh tahun; bila Apps Script
+// menolak/timeout (respons "API is running"), ambil per bulan secara BERURUTAN lalu gabungkan.
+async function getRealisasisResilient(params) {
+    try {
+        return await apiCall('getRealisasis', Object.assign({ _tries: 2 }, params));
+    } catch (e) {
+        if (params.kua || params.month) throw e;     // sudah sempit; tidak ada yang bisa dipersempit
+        console.warn('[REALISASI] Request penuh gagal, ambil per bulan (berurutan):', e.message);
+        if (typeof showNotification === 'function') {
+            showNotification('Server sibuk, memuat data per bulan…', 'info');
+        }
+        const merged = [];
+        let okCount = 0;
+        for (const m of _AP_MONTHS) {
+            try {
+                const part = await apiCall('getRealisasis', Object.assign({ _tries: 2 }, params, { month: m }));
+                (part || []).forEach(r => merged.push(r));
+                okCount++;
+            } catch (err) {
+                console.warn('[REALISASI] Bulan ' + m + ' gagal dimuat:', err.message);
+            }
+        }
+        if (okCount === 0) throw e;
+        if (okCount < _AP_MONTHS.length && typeof showNotification === 'function') {
+            showNotification('Sebagian bulan gagal dimuat, klik Load Data lagi untuk melengkapi.', 'warning');
+        }
+        return merged;
+    }
+}
+
 async function loadVerifikasiWithFilters() {
     console.log('[VERIFIKASI] Loading with filters...');
     showLoading();
@@ -8838,7 +8936,7 @@ async function loadVerifikasiWithFilters() {
         const yearFilter = document.getElementById('verifikasiYearFilter');
         const year = yearFilter ? parseInt(yearFilter.value) : new Date().getFullYear();
         
-        let realisasis = await apiCall('getRealisasis', { year: year });
+        let realisasis = await getRealisasisResilient({ year: year });
         
         // Simpan ke raw data
         rawData.verifikasi = realisasis;
@@ -8858,23 +8956,10 @@ async function loadVerifikasiWithFilters() {
             
             const _prefetchPromises = [];
             
-            // Prefetch RPDs per KUA (merge ke existing cache)
-            _vKUAs.forEach(kua => {
-                const _cachedRPDs = getLocalCache('rpds') || [];
-                const _hasKUA = _cachedRPDs.some(r => r.kua === kua);
-                if (!_hasKUA) {
-                    _prefetchPromises.push(
-                        apiCall('getRPDs', { kua: kua, year: year }).then(rpds => {
-                            const _existing = getLocalCache('rpds') || [];
-                            const _merged   = [..._existing.filter(r => r.kua !== kua), ...rpds];
-                            updateLocalCache('rpds', _merged);
-                            rawData.rpds = sortByMonth(_merged);
-                            console.log('[VERIFIKASI PREFETCH] RPDs cached for KUA:', kua);
-                        }).catch(() => {})
-                    );
-                }
-            });
-            
+            // ✅ DIHAPUS: prefetch getRPDs per KUA (hingga 31 request paralel).
+            //    verifyRealisasi() sudah mengambil RPD per KUA secara on-demand saat tombol
+            //    Verifikasi diklik, jadi prefetch massal tidak diperlukan dan memicu
+            //    kemacetan Apps Script (404 / "API is running").
             // Prefetch AP Config + Nominals
             _prefetchPromises.push(apGetConfig());
             _vMonths.forEach(mk => {
@@ -9104,16 +9189,25 @@ let _apNominals = {};    // { 'BulanTahun': { 'KUA Xyz': { '522111': 0, '522112'
 // CORE HELPERS
 // ------------------------------------------------------------------
 /** Ambil config AP (lazy-load, cache sesi) */
+let _apConfigPromise = null;   // dedupe request yang sedang berjalan
 async function apGetConfig() {
     if (_apConfig !== null) return _apConfig;
-    try {
-        const raw = await apiCall('getAutoPaymentConfig', {});
-        _apConfig = raw || {};
-    } catch (e) {
-        console.warn('[AP] getAutoPaymentConfig failed:', e);
-        _apConfig = {};
-    }
-    return _apConfig;
+    if (_apConfigPromise) return _apConfigPromise;
+    _apConfigPromise = (async () => {
+        try {
+            const raw = await apiCall('getAutoPaymentConfig', {});
+            _apConfig = raw || {};
+        } catch (e) {
+            // ✅ Jangan simpan kegagalan sebagai config kosong permanen:
+            //    kembalikan {} sementara, percobaan berikutnya akan fetch ulang.
+            console.warn('[AP] getAutoPaymentConfig failed:', e);
+            return {};
+        } finally {
+            _apConfigPromise = null;
+        }
+        return _apConfig;
+    })();
+    return _apConfigPromise;
 }
 
 /** Reset cache config (misal setelah save) */
@@ -9134,17 +9228,52 @@ function apGetActiveKUAs() {
 }
 
 /** Ambil nominal AP untuk bulan+tahun (lazy-load, cache sesi) */
+const _apNominalInflight = {};   // key -> Promise (dedupe request yang sedang berjalan)
 async function apGetNominals(month, year) {
     const key = `${month}_${year}`;
     if (_apNominals[key]) return _apNominals[key];
-    try {
-        const raw = await apiCall('getAutoPaymentNominal', { month, year });
-        _apNominals[key] = raw || {};
-    } catch (e) {
-        console.warn('[AP] getAutoPaymentNominal failed:', e);
-        _apNominals[key] = {};
+    if (_apNominalInflight[key]) return _apNominalInflight[key];
+    _apNominalInflight[key] = (async () => {
+        try {
+            const raw = await apiCall('getAutoPaymentNominal', { month, year });
+            _apNominals[key] = raw || {};
+            return _apNominals[key];
+        } catch (e) {
+            // ✅ Kegagalan TIDAK di-cache (sebelumnya disimpan sebagai {} sehingga hitungan
+            //    SAKTI salah sepanjang sesi). Kembalikan {} sementara saja.
+            console.warn('[AP] getAutoPaymentNominal failed:', e);
+            return {};
+        } finally {
+            delete _apNominalInflight[key];
+        }
+    })();
+    return _apNominalInflight[key];
+}
+
+const _AP_MONTHS = ['Januari','Februari','Maret','April','Mei','Juni',
+                    'Juli','Agustus','September','Oktober','November','Desember'];
+let _apYearUnsupported = false;
+/**
+ * Preload nominal SAKTI setahun dengan SATU request (action getAutoPaymentNominalYear).
+ * Jika backend belum diperbarui, fallback: hanya bulan yang ada di cache realisasi +
+ * bulan berjalan, dimuat berurutan (bukan 12 request paralel).
+ */
+async function apPreloadYear(year, extraMonths) {
+    year = parseInt(year);
+    if (!_apYearUnsupported) {
+        try {
+            const raw = await apiCall('getAutoPaymentNominalYear', { year });
+            _AP_MONTHS.forEach(m => { _apNominals[`${m}_${year}`] = (raw && raw[m]) ? raw[m] : {}; });
+            return true;
+        } catch (e) {
+            console.warn('[AP] getAutoPaymentNominalYear gagal, fallback per bulan:', e);
+            if (/tidak dikenal|Unknown/i.test(e && e.message || '')) _apYearUnsupported = true;
+        }
     }
-    return _apNominals[key];
+    const months = new Set(extraMonths || []);
+    months.add(_AP_MONTHS[new Date().getMonth()]);
+    for (const m of months) { await apGetNominals(m, year); }   // berurutan
+    return false;
 }
 
 /** Parse angka dari input (handle dot/comma separator) */

@@ -116,8 +116,7 @@ function validateOptimisticLock(data, existingUpdatedAt) {
  */
 function _getConfigValue(key) {
   try {
-    const sheet = getSheet(SHEETS.CONFIG);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.CONFIG);
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][0] === key) return rows[i][1];
     }
@@ -132,8 +131,7 @@ function _getConfigValue(key) {
  */
 function _getBudgetTotalForKUA(kua, year) {
   try {
-    const sheet = getSheet(SHEETS.BUDGET);
-    const rows = sheet.getDataRange().getValues();
+    const rows = _sheetValues(SHEETS.BUDGET);
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][1] === kua && rows[i][2] == year) {
         return parseFloat(rows[i][3]) || 0;
@@ -162,9 +160,10 @@ function saveRPDEnhanced(data) {
   const lockKey = 'RPD_' + data.kua + '_' + data.month + '_' + data.year;
   
   return executeWithLock(lockKey, function() {
+    _memoStart();   // ✅ PERFORMA: tiap sheet dibaca sekali selama lock dipegang (dibersihkan di finally)
     try {
       const sheet = getSheet(SHEETS.RPD);
-      const rows = sheet.getDataRange().getValues();
+      const rows = _sheetValues(SHEETS.RPD);
       const now = new Date();
 
       // ✅ BARU — Cari dulu row yang cocok (kua+month+year) SEBELUM menulis
@@ -220,12 +219,9 @@ function saveRPDEnhanced(data) {
           return errorResponse('Data sudah diubah oleh user lain. Silakan refresh dan coba lagi.');
         }
         
-        // Update existing RPD
-        sheet.getRange(i + 1, 5).setValue(parseFloat(data.total) || 0);
-        sheet.getRange(i + 1, 6).setValue(JSON.stringify(data.data));
-        sheet.getRange(i + 1, 8).setValue(now);
-        sheet.getRange(i + 1, 9).setValue(data.userId);
-        sheet.getRange(i + 1, 10).setValue(data.username);
+        // Update existing RPD — ✅ 2 penulisan (E:F dan H:J) menggantikan 5 setValue terpisah
+        sheet.getRange(i + 1, 5, 1, 2).setValues([[parseFloat(data.total) || 0, JSON.stringify(data.data)]]);
+        sheet.getRange(i + 1, 8, 1, 3).setValues([[now, data.userId, data.username]]);
         
         Logger.log('[SAVE_RPD_ENHANCED] ✓ Updated RPD at row: ' + (i + 1));
         
@@ -263,6 +259,8 @@ function saveRPDEnhanced(data) {
     } catch (error) {
       Logger.log('[SAVE_RPD_ENHANCED ERROR] ' + error.toString());
       return errorResponse('Gagal menyimpan RPD: ' + error.toString());
+    } finally {
+      _memoStop();
     }
   }, 30);
 }
@@ -326,8 +324,7 @@ function _validateRealisasiAgainstRPD(data, excludeId) {
 
     // ── Kumpulkan RPD 1 tahun (semua bulan) per (kode,item); ────────
     // ── sekaligus simpan data RPD bulan yang sama secara utuh ───────
-    var rpdSheet = getSheet(SHEETS.RPD);
-    var rpdRows  = rpdSheet.getDataRange().getValues();
+    var rpdRows  = _sheetValues(SHEETS.RPD);
     var rpdAnnualByKUA = {};
     var rpdMonthData   = null; // {code:{item:val}} khusus bulan yg sedang diisi
     for (var i = 1; i < rpdRows.length; i++) {
@@ -363,8 +360,7 @@ function _validateRealisasiAgainstRPD(data, excludeId) {
 
     // ── Kumpulkan realisasi Approved/Paid 1 tahun, per (kode,item) ──
     // ── (AP-aware, exclude row yang sedang diedit) ──────────────────
-    var realSheet = getSheet(SHEETS.REALISASI);
-    var realRows  = realSheet.getDataRange().getValues();
+    var realRows  = _sheetValues(SHEETS.REALISASI);
     var usedByKUA = {};
     for (var j = 1; j < realRows.length; j++) {
       if (realRows[j][1] !== kua || realRows[j][4] != year) continue;
@@ -431,9 +427,10 @@ function saveRealisasiEnhanced(data) {
   const lockKey = 'REALISASI_' + data.kua + '_' + data.month + '_' + data.year;
   
   return executeWithLock(lockKey, function() {
+    _memoStart();   // ✅ PERFORMA: Realisasi/RPD/Budget/AP dibaca SEKALI selama lock (sebelumnya 3–4× per sheet)
     try {
       const sheet = getSheet(SHEETS.REALISASI);
-      const rows = sheet.getDataRange().getValues();
+      const rows = _sheetValues(SHEETS.REALISASI);
       const now = new Date();
       
       if (data.id) {
@@ -466,13 +463,16 @@ function saveRealisasiEnhanced(data) {
             // Update realisasi
             // ✅ CORRECT COLUMN INDICES (1-based):
             // C(3)=Bulan, D(4)=RPD_ID, E(5)=Tahun, F(6)=Total, G(7)=Data, H(8)=Files, L(12)=UpdatedAt
-            sheet.getRange(i + 1, 3).setValue(data.month);                      // C: Bulan
-            sheet.getRange(i + 1, 4).setValue(data.rpdId || '');                // D: RPD ID
-            sheet.getRange(i + 1, 5).setValue(data.year);                       // E: Tahun
-            sheet.getRange(i + 1, 6).setValue(parseFloat(data.total) || 0);     // F: Total ✅
-            sheet.getRange(i + 1, 7).setValue(JSON.stringify(data.data || {})); // G: Data
-            sheet.getRange(i + 1, 8).setValue(JSON.stringify(data.files || []));// H: Files ✅
-            sheet.getRange(i + 1, 9).setValue('Waiting');                       // I: Status reset
+            // ✅ PERFORMA: C..I ditulis dalam SATU setValues (sebelumnya 7 setValue terpisah) + L
+            sheet.getRange(i + 1, 3, 1, 7).setValues([[
+              data.month,                          // C: Bulan
+              data.rpdId || '',                    // D: RPD ID
+              data.year,                           // E: Tahun
+              parseFloat(data.total) || 0,         // F: Total ✅
+              JSON.stringify(data.data || {}),     // G: Data
+              JSON.stringify(data.files || []),    // H: Files ✅
+              'Waiting'                            // I: Status reset
+            ]]);
             sheet.getRange(i + 1, 12).setValue(now.toISOString());              // L: Updated At ✅
             
             Logger.log('[SAVE_REALISASI_ENHANCED] ✓ Updated realisasi: ' + data.id);
@@ -503,8 +503,7 @@ function saveRealisasiEnhanced(data) {
         // ✅ Validate: Nominal tidak boleh melebihi sisa budget tahunan (khusus Operator KUA)
         if (data.role === 'Operator KUA' || !data.role || data.role !== 'Admin') {
           try {
-            const budgetSheet  = getSheet(SHEETS.BUDGET);
-            const budgetRows   = budgetSheet.getDataRange().getValues();
+            const budgetRows   = _sheetValues(SHEETS.BUDGET);
             let annualBudget   = 0;
             for (let i = 1; i < budgetRows.length; i++) {
               if (budgetRows[i][1] === data.kua && budgetRows[i][2] == data.year) {
@@ -581,6 +580,8 @@ function saveRealisasiEnhanced(data) {
     } catch (error) {
       Logger.log('[SAVE_REALISASI_ENHANCED ERROR] ' + error.toString());
       return errorResponse('Gagal menyimpan realisasi: ' + error.toString());
+    } finally {
+      _memoStop();
     }
   }, 30);
 }
@@ -611,8 +612,7 @@ function verifyRealisasiEnhanced(data) {
           }
           
           // Update status and notes
-          sheet.getRange(i + 1, 9).setValue(data.status);
-          sheet.getRange(i + 1, 10).setValue(data.catatan || '');
+          sheet.getRange(i + 1, 9, 1, 2).setValues([[data.status, data.catatan || '']]);   // I:J sekaligus
           sheet.getRange(i + 1, 13).setValue(now);
           
           Logger.log('[VERIFY_REALISASI_ENHANCED] ✓ Verified: ' + data.id + ' -> ' + data.status);
@@ -710,13 +710,9 @@ function getDashboardStatsOptimized(data) {
     const kua = data.kua;
     
     // ✅ Get all sheets data once
-    const budgetSheet = getSheet(SHEETS.BUDGET);
-    const rpdSheet = getSheet(SHEETS.RPD);
-    const realisasiSheet = getSheet(SHEETS.REALISASI);
-    
-    const budgetRows = budgetSheet.getDataRange().getValues();
-    const rpdRows = rpdSheet.getDataRange().getValues();
-    const realisasiRows = realisasiSheet.getDataRange().getValues();
+    const budgetRows = _sheetValues(SHEETS.BUDGET);
+    const rpdRows = _sheetValues(SHEETS.RPD);
+    const realisasiRows = _sheetValues(SHEETS.REALISASI);
     
     // Initialize stats
     let stats = {
