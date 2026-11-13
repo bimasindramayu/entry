@@ -82,15 +82,21 @@ function normalizeKUA(value) {
         .trim();
 }
 
-// Satu sumber daftar KUA: konfigurasi utama aplikasi (APP_CONFIG.KUA_LIST).
+// Format baku penyimpanan di Google Sheet harus selalu "KUA Nama Kecamatan".
+function formatKUA(value) {
+    const normalized = normalizeKUA(value);
+    return normalized ? `KUA ${normalized}` : '';
+}
+
+// Dropdown memakai label singkat, tetapi value tetap menggunakan format baku.
 function populateKUAOptions(selectedValue = '') {
     const select = document.getElementById('formKUA');
     if (!select) return;
 
-    const selected = normalizeKUA(selectedValue);
+    const selected = formatKUA(selectedValue);
     const kuaList = [...new Set(
         APP_CONFIG.KUA_LIST
-            .map(normalizeKUA)
+            .map(formatKUA)
             .filter(Boolean)
     )];
 
@@ -98,12 +104,12 @@ function populateKUAOptions(selectedValue = '') {
     select.add(new Option('Pilih KUA', ''));
 
     kuaList.forEach(kua => {
-        select.add(new Option(kua, kua));
+        select.add(new Option(normalizeKUA(kua), kua));
     });
 
     // Jaga data historis agar tetap dapat diedit meskipun tidak ada di konfigurasi.
     if (selected && !kuaList.includes(selected)) {
-        select.add(new Option(`${selected} (data lama)`, selected));
+        select.add(new Option(`${normalizeKUA(selected)} (data lama)`, selected));
     }
 
     select.value = selected;
@@ -241,7 +247,7 @@ async function handleUserSubmit(event) {
     const name = document.getElementById('formName').value;
     const password = document.getElementById('formPassword').value;
     const role = document.getElementById('formRole').value;
-    const kua = normalizeKUA(document.getElementById('formKUA').value);
+    const kua = formatKUA(document.getElementById('formKUA').value);
     
     // Validation
     if (role === 'Operator KUA' && !kua) {
@@ -318,7 +324,7 @@ async function resetUserPassword(userId) {
             username: user.username,
             name: user.name,
             role: user.role,
-            kua: normalizeKUA(user.kua),
+            kua: formatKUA(user.kua),
             password: 'Kua123!'
         });
 
