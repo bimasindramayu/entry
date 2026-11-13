@@ -317,15 +317,10 @@ async function resetUserPassword(userId) {
     }
 
     try {
-        // Gunakan saveUser yang sudah tersedia di backend agar tidak perlu
-        // menambah endpoint Apps Script baru.
-        await apiCall('saveUser', {
-            id: user.id,
-            username: user.username,
-            name: user.name,
-            role: user.role,
-            kua: formatKUA(user.kua),
-            password: 'Kua123!'
+        // Endpoint khusus ini hanya mengubah kolom Password (C) pada Sheet Users.
+        // Tidak mengirim atau menulis ulang data profil pengguna.
+        await apiCall('resetOperatorPassword', {
+            id: user.id
         });
 
         showNotification(
