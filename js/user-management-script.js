@@ -57,48 +57,101 @@ function displayUsers() {
         `;
         
         tbody.appendChild(tr);
+
+        // Reset password hanya tersedia untuk akun Operator KUA.
+        if (user.role === 'Operator KUA') {
+            const actionCell = tr.querySelector('td:last-child');
+            const resetButton = document.createElement('button');
+            resetButton.type = 'button';
+            resetButton.className = 'btn btn-sm btn-secondary';
+            resetButton.textContent = 'Reset Password';
+            resetButton.style.marginTop = '4px';
+            resetButton.addEventListener('click', () => {
+                confirmResetUserPassword(user.id, user.username);
+            });
+            actionCell.appendChild(resetButton);
+        }
     });
+}
+
+// Samakan format nama KUA, baik "KUA Anjatan" maupun "Anjatan".
+function normalizeKUA(value) {
+    return String(value || '')
+        .trim()
+        .replace(/^KUA\\s+/i, '')
+        .trim();
+}
+
+// Satu sumber daftar KUA: konfigurasi utama aplikasi (APP_CONFIG.KUA_LIST).
+function populateKUAOptions(selectedValue = '') {
+    const select = document.getElementById('formKUA');
+    if (!select) return;
+
+    const selected = normalizeKUA(selectedValue);
+    const kuaList = [...new Set(
+        APP_CONFIG.KUA_LIST
+            .map(normalizeKUA)
+            .filter(Boolean)
+    )];
+
+    select.innerHTML = '';
+    select.add(new Option('Pilih KUA', ''));
+
+    kuaList.forEach(kua => {
+        select.add(new Option(kua, kua));
+    });
+
+    // Jaga data historis agar tetap dapat diedit meskipun tidak ada di konfigurasi.
+    if (selected && !kuaList.includes(selected)) {
+        select.add(new Option(`${selected} (data lama)`, selected));
+    }
+
+    select.value = selected;
 }
 
 // ===== MODAL FUNCTIONS =====
 function showUserModal(userId = null) {
-    const modal = document.getElementById('userModal');
-    if (!modal) {
+    if (!document.getElementById('userModal')) {
         createUserModal();
     }
-    
+
     const form = document.getElementById('userForm');
     const modalTitle = document.getElementById('modalTitle');
-    
-    if (userId) {
-        const user = allUsers.find(u => u.id === userId);
+    const passwordGroup = document.getElementById('passwordGroup');
+    const passwordInput = document.getElementById('formPassword');
+
+    if (userId !== null && userId !== undefined && userId !== '') {
+        const user = allUsers.find(u => String(u.id) === String(userId));
         if (!user) return;
-        
+
         modalTitle.textContent = 'Edit Pengguna';
         document.getElementById('userId').value = user.id;
-        document.getElementById('formUsername').value = user.username;
-        document.getElementById('formName').value = user.name;
-        document.getElementById('formRole').value = user.role;
-        document.getElementById('formKUA').value = user.kua || '';
-        
-        // Password optional for edit
-        const passwordGroup = document.getElementById('passwordGroup');
-        if (passwordGroup) {
-            passwordGroup.querySelector('label').textContent = 'Password (kosongkan jika tidak diubah)';
-            document.getElementById('formPassword').required = false;
-        }
+        document.getElementById('formUsername').value = user.username || '';
+        document.getElementById('formName').value = user.name || '';
+        document.getElementById('formRole').value = user.role || '';
+
+        // Daftar KUA disiapkan sebelum nilai pengguna lama dipilih.
+        populateKUAOptions(user.kua || '');
+
+        // Password tidak diedit dari form. Gunakan aksi Reset Password.
+        passwordGroup.style.display = 'none';
+        passwordInput.value = '';
+        passwordInput.required = false;
     } else {
         modalTitle.textContent = 'Tambah Pengguna';
         form.reset();
         document.getElementById('userId').value = '';
-        
-        const passwordGroup = document.getElementById('passwordGroup');
-        if (passwordGroup) {
-            passwordGroup.querySelector('label').textContent = 'Password';
-            document.getElementById('formPassword').required = true;
-        }
+
+        passwordGroup.style.display = '';
+        passwordGroup.querySelector('label').textContent = 'Password *';
+        passwordInput.value = '';
+        passwordInput.required = true;
+
+        populateKUAOptions();
     }
-    
+
+    // Pastikan tampilan dan validasi KUA mengikuti role yang sedang dipilih.
+    toggleKUAField();
     document.getElementById('userModal').classList.add('active');
 }
 
@@ -149,34 +202,6 @@ function createUserModal() {
                         <label>KUA *</label>
                         <select id="formKUA">
                             <option value="">Pilih KUA</option>
-                            <option value="Anjatan">Anjatan</option>
-                            <option value="Arahan">Arahan</option>
-                            <option value="Balongan">Balongan</option>
-                            <option value="Bantarujeg">Bantarujeg</option>
-                            <option value="Bongas">Bongas</option>
-                            <option value="Cantigi">Cantigi</option>
-                            <option value="Cikedung">Cikedung</option>
-                            <option value="Gabuswetan">Gabuswetan</option>
-                            <option value="Gantar">Gantar</option>
-                            <option value="Haurgeulis">Haurgeulis</option>
-                            <option value="Indramayu">Indramayu</option>
-                            <option value="Jatibarang">Jatibarang</option>
-                            <option value="Juntinyuat">Juntinyuat</option>
-                            <option value="Kandanghaur">Kandanghaur</option>
-                            <option value="Karangampel">Karangampel</option>
-                            <option value="Kertasemaya">Kertasemaya</option>
-                            <option value="Krangkeng">Krangkeng</option>
-                            <option value="Lelea">Lelea</option>
-                            <option value="Lohbener">Lohbener</option>
-                            <option value="Losarang">Losarang</option>
-                            <option value="Patrol">Patrol</option>
-                            <option value="Sliyeg">Sliyeg</option>
-                            <option value="Sukagumiwang">Sukagumiwang</option>
-                            <option value="Sukra">Sukra</option>
-                            <option value="Sindang">Sindang</option>
-                            <option value="Terisi">Terisi</option>
-                            <option value="Tukdana">Tukdana</option>
-                            <option value="Widasari">Widasari</option>
                         </select>
                     </div>
                     
@@ -216,7 +241,7 @@ async function handleUserSubmit(event) {
     const name = document.getElementById('formName').value;
     const password = document.getElementById('formPassword').value;
     const role = document.getElementById('formRole').value;
-    const kua = document.getElementById('formKUA').value;
+    const kua = normalizeKUA(document.getElementById('formKUA').value);
     
     // Validation
     if (role === 'Operator KUA' && !kua) {
@@ -233,8 +258,9 @@ async function handleUserSubmit(event) {
             kua: role === 'Operator KUA' ? kua : ''
         };
         
-        // Only send password if it's filled
-        if (password) {
+        // Password hanya diisi saat membuat pengguna baru.
+        // Untuk pengguna yang sudah ada, gunakan tombol Reset Password.
+        if (!userId && password) {
             userData.password = password;
         }
         
@@ -262,6 +288,46 @@ async function deleteUser(userId) {
         loadUsers();
     } catch (error) {
         showNotification(error.message || 'Gagal menghapus user', 'error');
+    }
+}
+
+// ===== RESET PASSWORD OPERATOR KUA =====
+function confirmResetUserPassword(userId, username) {
+    const confirmed = confirm(
+        `Reset password Operator KUA "${username}" menjadi "Kua123!"?`
+    );
+
+    if (confirmed) {
+        resetUserPassword(userId);
+    }
+}
+
+async function resetUserPassword(userId) {
+    const user = allUsers.find(u => String(u.id) === String(userId));
+
+    if (!user || user.role !== 'Operator KUA') {
+        showNotification('Reset password hanya tersedia untuk Operator KUA.', 'error');
+        return;
+    }
+
+    try {
+        // Gunakan saveUser yang sudah tersedia di backend agar tidak perlu
+        // menambah endpoint Apps Script baru.
+        await apiCall('saveUser', {
+            id: user.id,
+            username: user.username,
+            name: user.name,
+            role: user.role,
+            kua: normalizeKUA(user.kua),
+            password: 'Kua123!'
+        });
+
+        showNotification(
+            `Password ${user.username} berhasil direset menjadi Kua123!`,
+            'success'
+        );
+    } catch (error) {
+        showNotification(error.message || 'Gagal mereset password pengguna.', 'error');
     }
 }
 
@@ -332,5 +398,6 @@ window.toggleKUAField = toggleKUAField;
 window.handleUserSubmit = handleUserSubmit;
 window.editUser = editUser;
 window.confirmDeleteUser = confirmDeleteUser;
+window.confirmResetUserPassword = confirmResetUserPassword;
 window.backToMenu = backToMenu;
 window.logout = logout;
