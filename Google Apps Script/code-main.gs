@@ -46,6 +46,9 @@ function doPost(e) {
       case 'saveUser':
         result = saveUser(data);
         break;
+      case 'resetOperatorPassword':
+        result = resetOperatorPassword(data);
+        break;
       case 'deleteUser':
         result = deleteUser(data);
         break;
@@ -460,6 +463,41 @@ function saveUser(data) {
   } catch (error) {
     Logger.log('[SAVE_USER ERROR] ' + error.toString());
     return errorResponse('Gagal menyimpan user: ' + error.toString());
+  }
+}
+
+// Reset password Operator KUA tanpa mengubah kolom profil atau timestamp.
+function resetOperatorPassword(data) {
+  try {
+    const userId = String(data.id || '').trim();
+    if (!userId) {
+      return errorResponse('ID pengguna tidak valid');
+    }
+
+    const sheet = getSheet('Users');
+    const rows = sheet.getDataRange().getValues();
+
+    for (let i = 1; i < rows.length; i++) {
+      if (String(rows[i][0] || '').trim() !== userId) continue;
+
+      // Pastikan target memang akun Operator KUA.
+      if (String(rows[i][4] || '').trim() !== 'Operator KUA') {
+        return errorResponse('Reset password hanya berlaku untuk Operator KUA');
+      }
+
+      // Kolom C = Password. Tidak mengubah Username, Name, Role, KUA,
+      // Created, Updated, atau kolom lainnya.
+      sheet.getRange(i + 1, 3).setValue('Kua123!');
+
+      return successResponse({
+        message: 'Password Operator KUA berhasil direset'
+      });
+    }
+
+    return errorResponse('User tidak ditemukan');
+  } catch (error) {
+    Logger.log('[RESET_OPERATOR_PASSWORD ERROR] ' + error.toString());
+    return errorResponse('Gagal mereset password: ' + error.toString());
   }
 }
 
