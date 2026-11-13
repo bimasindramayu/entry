@@ -78,7 +78,7 @@ function displayUsers() {
 function normalizeKUA(value) {
     return String(value || '')
         .trim()
-        .replace(/^KUA\\s+/i, '')
+        .replace(/^KUA\s+/i, '')
         .trim();
 }
 
